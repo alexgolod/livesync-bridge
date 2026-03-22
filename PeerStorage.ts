@@ -229,11 +229,19 @@ export class PeerStorage extends Peer {
         return false;
     }
     watcherDeno?: Deno.FsWatcher;
+    watchBasePath?: string;
+
+    isTempFile(path: string): boolean {
+        return /\.tmp\.\d+\.\d+$/.test(path) || /\.tmp$/.test(path);
+    }
 
     processFile(event: Deno.FsEvent) {
         for (const path of event.paths) {
+            // Guard: only process events for files under this peer's watch directory.
+            // Deno.watchFs leaks events across concurrent watchers in the same process.
+            if (this.watchBasePath && !path.startsWith(this.watchBasePath)) continue;
+            if (this.isTempFile(path)) continue;
             const key = `${event.kind}-${path}`;
-            // const key = path;
             scheduleTask(key, 100, async () => {
                 const existence = await Deno.stat(path).catch(() => null);
                 if (existence) {
@@ -255,6 +263,7 @@ export class PeerStorage extends Peer {
             this.watcherDeno = undefined;
         }
         const lP = this.toStoragePath(this.toLocalPath("."));
+        this.watchBasePath = lP;
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
         if (this.config.scanOfflineChanges) {
             for await (const entry of walk(lP)) {
@@ -299,6 +308,7 @@ export class PeerStorage extends Peer {
             });
 
         this.watcher.on("change", async (path) => {
+            if (this.isTempFile(path)) return;
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
@@ -308,6 +318,7 @@ export class PeerStorage extends Peer {
             }
         })
         this.watcher.on("add", async (path) => {
+            if (this.isTempFile(path)) return;
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             if (!await this.isChanged(ePath)) {
                 // this.debugLog(`Not changed: ${ePath}`);
@@ -317,6 +328,7 @@ export class PeerStorage extends Peer {
             }
         })
         this.watcher.on("unlink", async (path) => {
+            if (this.isTempFile(path)) return;
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
             this.debugLog(`Unlink detected: ${ePath}`);
             await this.dispatchDeleted(path)
