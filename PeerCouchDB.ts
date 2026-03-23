@@ -11,6 +11,15 @@ import { createBinaryBlob, createTextBlob, isDocContentSame, unique } from "./li
 export class PeerCouchDB extends Peer {
     man: DirectFileManipulator;
     declare config: PeerCouchDBConf;
+    watchdogInterval?: ReturnType<typeof setInterval>;
+    lastEventTime = Date.now();
+    consecutiveReconnects = 0;
+    sinceDebounceTimer?: ReturnType<typeof setTimeout>;
+
+    static WATCHDOG_CHECK_MS = 60_000;       // check every 60s
+    static WATCHDOG_STALE_MS = 5 * 60_000;   // stale after 5 min of silence
+    static MAX_BACKOFF_MS = 10 * 60_000;     // max 10 min between reconnects
+
     constructor(conf: PeerCouchDBConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
         this.man = new DirectFileManipulator(conf);
@@ -90,6 +99,67 @@ export class PeerCouchDB extends Peer {
             deleted: ret.deleted
         };
     }
+
+    // Debounced since persistence — update in-memory immediately, write to disk every 2s
+    _persistSince(seq: string) {
+        this.man.since = seq;
+        if (this.sinceDebounceTimer) clearTimeout(this.sinceDebounceTimer);
+        this.sinceDebounceTimer = setTimeout(() => {
+            this.setSetting("since", seq);
+        }, 2000);
+    }
+
+    _flushSince() {
+        if (this.sinceDebounceTimer) {
+            clearTimeout(this.sinceDebounceTimer);
+            this.sinceDebounceTimer = undefined;
+        }
+        if (this.man.since) {
+            this.setSetting("since", `${this.man.since}`);
+        }
+    }
+
+    // Build the _changes feed callback (processes each interesting change)
+    _makeChangeCallback(baseDir: string) {
+        return async (entry: ReadyEntry, seq?: string | number) => {
+            // Track since from the sequence number for reliable reconnects
+            if (seq !== undefined) {
+                this._persistSince(`${seq}`);
+            }
+            this.consecutiveReconnects = 0; // got a real event, reset backoff
+            const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
+            let path = entry.path.substring(baseDir.length);
+            if (path.startsWith("/")) {
+                path = path.substring(1);
+            }
+            if (entry.deleted || entry._deleted) {
+                this.sendLog(`${path} delete detected`);
+                await this.dispatchDeleted(path);
+            } else {
+                const docData = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: entry.deleted || entry._deleted, data: d };
+                this.sendLog(`${path} change detected`);
+                await this.dispatch(path, docData);
+            }
+        };
+    }
+
+    // Build the interest-check filter (fires for ALL changes, not just matched ones)
+    _makeCheckInterested(baseDir: string) {
+        return (entry: MetaEntry) => {
+            this.lastEventTime = Date.now();
+            if (entry.path.indexOf(":") !== -1) return false;
+            return entry.path.startsWith(baseDir);
+        };
+    }
+
+    // Start watching the _changes feed
+    _startWatch(baseDir: string) {
+        this.man.beginWatch(
+            this._makeChangeCallback(baseDir),
+            this._makeCheckInterested(baseDir)
+        );
+    }
+
     async start(): Promise<void> {
         const baseDir = this.toLocalPath("");
         await this.man.ready.promise;
@@ -150,25 +220,59 @@ export class PeerCouchDB extends Peer {
         } else {
             this.normalLog(`Watch starting from ${this.man.since}`);
         }
-        this.man.beginWatch(async (entry) => {
-            const d = entry.type == "plain" ? entry.data : new Uint8Array(decodeBinary(entry.data));
-            let path = entry.path.substring(baseDir.length);
-            if (path.startsWith("/")) {
-                path = path.substring(1);
+
+        this._startWatch(baseDir);
+
+        // Watchdog: detect stale _changes feed and reconnect
+        this.watchdogInterval = setInterval(async () => {
+            try {
+                const silenceMs = Date.now() - this.lastEventTime;
+                if (silenceMs < PeerCouchDB.WATCHDOG_STALE_MS) return;
+
+                // Skip if the lib's own reconnect is already in progress
+                if (!this.man.watching) {
+                    this.normalLog(`Watchdog: watch already stopped/reconnecting — skipping`);
+                    this.lastEventTime = Date.now();
+                    return;
+                }
+
+                // Exponential backoff on consecutive reconnects
+                const backoffMs = Math.min(
+                    PeerCouchDB.WATCHDOG_CHECK_MS * Math.pow(2, this.consecutiveReconnects),
+                    PeerCouchDB.MAX_BACKOFF_MS
+                );
+                if (silenceMs < backoffMs) return;
+
+                // Health check: is CouchDB reachable? Use rawGet to reuse the lib's connection.
+                try {
+                    const result = await this.man.rawGet<Record<string, any>>(MILESTONE_DOCID);
+                    if (!result) throw new Error("unreachable");
+                } catch {
+                    this.normalLog(`Watchdog: no events for ${Math.round(silenceMs / 1000)}s, CouchDB unreachable — waiting`);
+                    return;
+                }
+
+                this.consecutiveReconnects++;
+                this.normalLog(`Watchdog: no events for ${Math.round(silenceMs / 1000)}s, reconnecting (attempt ${this.consecutiveReconnects})`);
+
+                // Flush pending since value before reconnect
+                this._flushSince();
+
+                // Tear down and reconnect. Must clear watching flag directly because
+                // endWatch() only sends cancel signal — the complete handler sets
+                // watching=false asynchronously which races with beginWatch().
+                this.man.endWatch();
+                this.man.watching = false;
+                this.man.changes = undefined;
+                this.man.since = this.getSetting("since") || this.man.since;
+                this.normalLog(`Watchdog: reconnecting from since=${this.man.since}`);
+                this.lastEventTime = Date.now();
+                this._startWatch(baseDir);
+            } catch (err) {
+                this.normalLog(`Watchdog: unexpected error: ${err}`);
+                this.lastEventTime = Date.now(); // prevent tight retry loop
             }
-            if (entry.deleted || entry._deleted) {
-                this.sendLog(`${path} delete detected`);
-                await this.dispatchDeleted(path);
-            } else {
-                const docData = { ctime: entry.ctime, mtime: entry.mtime, size: entry.size, deleted: entry.deleted || entry._deleted, data: d };
-                this.sendLog(`${path} change detected`);
-                await this.dispatch(path, docData);
-            }
-        }, (entry) => {
-            this.setSetting("since", this.man.since);
-            if (entry.path.indexOf(":") !== -1) return false;
-            return entry.path.startsWith(baseDir);
-        });
+        }, PeerCouchDB.WATCHDOG_CHECK_MS);
     }
     async dispatch(path: string, data: FileData | false) {
         if (data === false) return;
@@ -185,6 +289,11 @@ export class PeerCouchDB extends Peer {
         }
     }
     async stop(): Promise<void> {
+        if (this.watchdogInterval) {
+            clearInterval(this.watchdogInterval);
+            this.watchdogInterval = undefined;
+        }
+        this._flushSince();
         this.man.endWatch();
         return await Promise.resolve();
     }
