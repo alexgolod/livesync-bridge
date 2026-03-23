@@ -229,13 +229,6 @@ export class PeerCouchDB extends Peer {
                 const silenceMs = Date.now() - this.lastEventTime;
                 if (silenceMs < PeerCouchDB.WATCHDOG_STALE_MS) return;
 
-                // Skip if the lib's own reconnect is already in progress
-                if (!this.man.watching) {
-                    this.normalLog(`Watchdog: watch already stopped/reconnecting — skipping`);
-                    this.lastEventTime = Date.now();
-                    return;
-                }
-
                 // Exponential backoff on consecutive reconnects
                 const backoffMs = Math.min(
                     PeerCouchDB.WATCHDOG_CHECK_MS * Math.pow(2, this.consecutiveReconnects),
@@ -253,14 +246,17 @@ export class PeerCouchDB extends Peer {
                 }
 
                 this.consecutiveReconnects++;
-                this.normalLog(`Watchdog: no events for ${Math.round(silenceMs / 1000)}s, reconnecting (attempt ${this.consecutiveReconnects})`);
+                const wasWatching = this.man.watching;
+                this.normalLog(`Watchdog: no events for ${Math.round(silenceMs / 1000)}s, watching=${wasWatching}, reconnecting (attempt ${this.consecutiveReconnects})`);
 
                 // Flush pending since value before reconnect
                 this._flushSince();
 
-                // Tear down and reconnect. Must clear watching flag directly because
-                // endWatch() only sends cancel signal — the complete handler sets
-                // watching=false asynchronously which races with beginWatch().
+                // Tear down and reconnect. Clear watching/changes directly —
+                // endWatch() only sends cancel signal, the complete handler
+                // sets watching=false asynchronously which races with beginWatch().
+                // Also handles the case where watching is already false (lib's
+                // own reconnect failed, e.g. CouchDB was unreachable during sleep).
                 this.man.endWatch();
                 this.man.watching = false;
                 this.man.changes = undefined;
