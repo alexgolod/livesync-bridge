@@ -10,23 +10,30 @@ export class Hub {
     constructor(conf: Config) {
         this.conf = conf;
     }
-    start() {
+    async start() {
         for (const p of this.peers) {
             p.stop();
         }
         this.peers = [];
+        const couchdbPeers: PeerCouchDB[] = [];
+        const storagePeers: PeerStorage[] = [];
         for (const peer of this.conf.peers) {
             if (peer.type == "couchdb") {
                 const p = new PeerCouchDB(peer, this.dispatch.bind(this));
                 this.peers.push(p);
+                couchdbPeers.push(p);
             } else if (peer.type == "storage") {
                 const p = new PeerStorage(peer, this.dispatch.bind(this));
                 this.peers.push(p);
+                storagePeers.push(p);
             } else {
                 throw new Error(`Unexpected Peer type: ${(peer as any)?.name} - ${(peer as any)?.type}`);
             }
         }
-        for (const p of this.peers) {
+        // Start CouchDB peers first and wait for them to be ready,
+        // so storage peers can safely dispatch during offline scan.
+        await Promise.all(couchdbPeers.map(p => p.start()));
+        for (const p of storagePeers) {
             p.start();
         }
     }

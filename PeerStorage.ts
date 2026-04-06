@@ -163,11 +163,17 @@ export class PeerStorage extends Peer {
 
         scheduleOnceIfDuplicated(pathSrc, async () => {
             // console.log(data);
-            await this.writeFileStat(path);
             await delay(250);
             if (!await this.isRepeating(path, data)) {
                 this.sendLog(`${path} change detected`);
-                await this.dispatchToHub(this, this.toGlobalPath(path), data);
+                try {
+                    await this.dispatchToHub(this, this.toGlobalPath(path), data);
+                    // Only mark as synced AFTER successful dispatch
+                    await this.writeFileStat(path);
+                } catch (ex) {
+                    this.debugLog(`${path} dispatch failed, will retry on next change or restart`);
+                    Logger(ex, LOG_LEVEL_VERBOSE);
+                }
             }
             // else {
             //     this.sendLog(`${path} change repeating detected`);
